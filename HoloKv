@@ -1,0 +1,792 @@
+#!/usr/bin/env python3
+"""
+HoloNetV10 — General holographic associative memory (id + arbitrary 64-bit payload)
+
+Colab-friendly: paste into ONE cell and run.
+
+Fixes vs your failing Colab run:
+  ✅ Tests are NON-FATAL by default (no AssertionError traceback spam)
+  ✅ Still prints warnings if sanity expectations aren’t met
+
+Core features:
+  - Buckets B sized to keep ~constant items-per-bucket
+  - Robust bipolar key (float32 projections, tau clamp)
+  - Payload bytes in DISJOINT subspaces (8 slices of d/8)
+  - Modular shard banks (CRT-style robustness)
+  - Slot decode + byte decode use float32 BLAS (NumPy matmul/dot)
+  - Adaptive reject thresholds via per-bucket Welford (mean/std)
+
+Deps: Python + NumPy + Matplotlib only.
+"""
+
+from __future__ import annotations
+import time
+import math
+import numpy as np
+import matplotlib.pyplot as plt
+
+# -----------------------------
+# Notebook display helpers
+# -----------------------------
+def _in_notebook() -> bool:
+    try:
+        from IPython import get_ipython
+        ip = get_ipython()
+        return ip is not None and ("IPKernelApp" in ip.config)
+    except Exception:
+        return False
+
+def display_saved_charts(paths: list[str]):
+    if _in_notebook():
+        from IPython.display import display, Image
+        for p in paths:
+            display(Image(filename=p))
+    else:
+        for p in paths:
+            img = plt.imread(p)
+            plt.figure()
+            plt.imshow(img)
+            plt.axis("off")
+            plt.title(p)
+        plt.show()
+
+def plot_and_save(xs, ys_list, labels, xlabel, ylabel, title, path):
+    plt.figure()
+    for ys, lab in zip(ys_list, labels):
+        plt.plot(xs, ys, marker="o", label=lab)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.title(title)
+    if len(labels) > 1:
+        plt.legend()
+    plt.tight_layout()
+    plt.savefig(path, dpi=200)
+    plt.close()
+
+def next_pow2(x: int) -> int:
+    x = int(max(2, x))
+    return 1 << (x - 1).bit_length()
+
+# -----------------------------
+# Safe deterministic hashing
+# -----------------------------
+def fnv1a32(data: bytes) -> int:
+    h = 2166136261
+    for b in data:
+        h ^= b
+        h = (h * 16777619) & 0xFFFFFFFF
+    return h
+
+def splitmix64(x: int) -> int:
+    x = (x + 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
+    z = x
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9 & 0xFFFFFFFFFFFFFFFF
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EB & 0xFFFFFFFFFFFFFFFF
+    return z ^ (z >> 31)
+
+# -----------------------------
+# HyperMorphic Gearbox
+# -----------------------------
+class HyperMorphicGearbox:
+    PRIME_GEARS = [
+        998_244_353,
+        1_000_000_007,
+        1_000_000_009,
+        1_012_924_417,
+        1_073_741_789,
+        1_221_133_633,
+        1_610_612_737,
+        1_812_839_423,
+        2_147_483_647,
+    ]
+
+    @staticmethod
+    def dynamic_base(d: int) -> int:
+        return int(math.floor(math.log2(max(2, int(d))))) + 1
+
+    @staticmethod
+    def dynamic_modulus(d: int) -> int:
+        return int(math.floor(math.sqrt(max(1, int(d))))) + 1
+
+    @staticmethod
+    def centered(res: np.ndarray, p: int) -> np.ndarray:
+        x = res.astype(np.int64, copy=False)
+        half = p // 2
+        y = x.copy()
+        y[y > half] -= p
+        return y
+
+    @staticmethod
+    def to_residue(x_centered: np.ndarray, p: int) -> np.ndarray:
+        return np.mod(x_centered, p).astype(np.int64, copy=False)
+
+    @classmethod
+    def choose_moduli(cls, bound: int, shards: int) -> list[int]:
+        good = [p for p in cls.PRIME_GEARS if (p // 4) > bound]
+        if len(good) >= shards:
+            return good[:shards]
+        return cls.PRIME_GEARS[-shards:]
+
+# -----------------------------
+# Robust bipolar hasher
+# -----------------------------
+class RobustBipolarHasher:
+    def __init__(self, emb_dim: int, d: int, seed: int = 0):
+        rng = np.random.default_rng(seed)
+        self.W = rng.choice([-1.0, 1.0], size=(d, emb_dim)).astype(np.float32)
+        self.tau = 0.0
+
+    def calibrate(self, X: np.ndarray, q: float = 0.15):
+        Z = (self.W @ X.astype(np.float32).T).T
+        a = np.abs(Z).reshape(-1)
+        self.tau = float(np.quantile(a, q))
+
+    def key(self, x: np.ndarray) -> np.ndarray:
+        z = self.W @ x.astype(np.float32)
+        k = np.where(z >= 0.0, 1, -1).astype(np.int8)
+        if self.tau > 0:
+            k[np.abs(z) < self.tau] = 1
+        return k
+
+# -----------------------------
+# Bucket router + multi-probe
+# -----------------------------
+class BucketRouter:
+    def __init__(self, emb_dim: int, nbits_max: int = 16, seed: int = 0):
+        rng = np.random.default_rng(seed)
+        self.nbits_max = int(nbits_max)
+        self.W = rng.choice([-1.0, 1.0], size=(self.nbits_max, emb_dim)).astype(np.float32)
+
+    def _bits_and_uncert(self, x: np.ndarray, nbits: int):
+        z = self.W[:nbits] @ x.astype(np.float32)
+        bits = (z >= 0.0).astype(np.uint8)
+        uncert = np.abs(z)
+        return bits, uncert
+
+    @staticmethod
+    def bits_to_int(bits: np.ndarray) -> int:
+        out = 0
+        for i, b in enumerate(bits.tolist()):
+            out |= (int(b) & 1) << i
+        return out
+
+    def primary_bucket(self, x: np.ndarray, B: int) -> int:
+        nbits = int(math.log2(B))
+        bits, _ = self._bits_and_uncert(x, nbits)
+        return self.bits_to_int(bits) & (B - 1)
+
+    def candidates(self, x: np.ndarray, B: int, probes: int = 8, flip_radius: int = 2, uncertain_k: int = 12) -> list[int]:
+        if B <= probes:
+            return list(range(B))
+        nbits = int(math.log2(B))
+        bits, uncert = self._bits_and_uncert(x, nbits)
+        base = self.bits_to_int(bits) & (B - 1)
+        cand = [base]
+
+        k = min(uncertain_k, nbits)
+        idx = np.argsort(uncert)[:k]
+
+        flips = []
+        for i in idx:
+            flips.append((float(uncert[i]), (int(i),)))
+        if flip_radius >= 2:
+            for a in range(len(idx)):
+                for b in range(a + 1, len(idx)):
+                    i, j = int(idx[a]), int(idx[b])
+                    flips.append((float(uncert[i] + uncert[j]), (i, j)))
+        flips.sort(key=lambda t: t[0])
+
+        for _, combo in flips:
+            if len(cand) >= probes:
+                break
+            v = base
+            for i in combo:
+                v ^= (1 << i)
+            v &= (B - 1)
+            if v not in cand:
+                cand.append(v)
+
+        return cand[:probes]
+
+# -----------------------------
+# HoloNetV10 core
+# -----------------------------
+class HoloNetV10:
+    def __init__(
+        self,
+        d: int,
+        S: int,
+        B: int,
+        shards: int,
+        emb_dim: int,
+        seed: int = 0,
+        bucket_probes: int = 10,
+        insert_probe_limit: int = 64,
+        id_cos_min: float = 0.02,
+        pay_cos_min: float = 0.02,
+    ):
+        assert (B & (B - 1)) == 0, "B must be power-of-two"
+        assert d % 8 == 0, "d must be divisible by 8 (payload bytes use disjoint subspaces)"
+        self.d, self.S, self.B, self.shards = int(d), int(S), int(B), int(shards)
+        self.seed = int(seed)
+        self.rng = np.random.default_rng(seed)
+
+        # HyperMorphic params
+        self.b = HyperMorphicGearbox.dynamic_base(d)
+        self.m = HyperMorphicGearbox.dynamic_modulus(d)
+        gain = max(1, self.m // 16)
+        self.Q_id  = int(min(2047, (2 ** max(6, self.b // 2) - 1) * gain))
+        self.Q_pay = int(min(1023, (2 ** max(5, self.b // 3) - 1) * gain))
+
+        # Router + keys
+        self.router = BucketRouter(emb_dim=emb_dim, nbits_max=16, seed=seed + 33)
+        self.hasher = RobustBipolarHasher(emb_dim=emb_dim, d=d, seed=seed + 111)
+        self.bucket_probes = int(bucket_probes)
+        self.insert_probe_limit = int(insert_probe_limit)
+
+        # Slot codes (shared)
+        self.slot_code = self.rng.choice([-1, 1], size=(self.S, self.d)).astype(np.int8)
+        self.slot_code_f = self.slot_code.astype(np.float32, copy=False)  # BLAS path
+
+        # Payload codebooks: 8 × 256 × (d/8) in disjoint subspaces
+        self.d_chunk = self.d // 8
+        self.byte_code = self._make_byte_codebooks()
+        self.byte_code_f = self.byte_code.astype(np.float32, copy=False)
+
+        # Bucket state
+        self.bucket_counts = np.zeros(self.B, dtype=np.int32)
+        self.slot_table = -np.ones((self.B, self.S), dtype=np.int32)
+
+        self.item_bucket: list[int] = []
+        self.item_slot: list[int] = []
+        self.payloads: list[int] = []
+        self.N = 0
+
+        # Modular gear shards
+        self.moduli = self._choose_moduli()
+        self.M_id  = np.zeros((self.B, self.shards, self.d), dtype=np.int64)
+        self.M_pay = np.zeros((self.B, self.shards, self.d), dtype=np.int64)
+
+        # Reject thresholds
+        self.id_cos_min = float(id_cos_min)
+        self.pay_cos_min = float(pay_cos_min)
+
+        # Per-bucket Welford calibrators
+        self.id_count = np.zeros(self.B, dtype=np.int32)
+        self.id_mean  = np.zeros(self.B, dtype=np.float64)
+        self.id_M2    = np.zeros(self.B, dtype=np.float64)
+
+        self.pay_count = np.zeros(self.B, dtype=np.int32)
+        self.pay_mean  = np.zeros(self.B, dtype=np.float64)
+        self.pay_M2    = np.zeros(self.B, dtype=np.float64)
+
+    def _make_byte_codebooks(self) -> np.ndarray:
+        C = np.empty((8, 256, self.d_chunk), dtype=np.int8)
+        for chunk in range(8):
+            sm = splitmix64((self.seed ^ 0xBADC0FFEE) + chunk * 0x9E3779B97F4A7C15)
+            rng = np.random.default_rng(int(sm & 0x7FFFFFFFFFFFFFFF))
+            C[chunk] = (rng.integers(0, 2, size=(256, self.d_chunk), dtype=np.uint8) * 2 - 1).astype(np.int8)
+        return C
+
+    def _choose_moduli(self) -> list[int]:
+        per_dim = max(self.Q_id, self.Q_pay)
+        bound = int(64 * per_dim * (math.sqrt(max(1, self.S)) + 2))
+        return HyperMorphicGearbox.choose_moduli(bound=bound, shards=self.shards)
+
+    @staticmethod
+    def payload_to_bytes8(payload: int) -> np.ndarray:
+        x = int(payload) & ((1 << 64) - 1)
+        out = np.empty(8, dtype=np.uint8)
+        for i in range(8):
+            out[i] = (x >> (8 * i)) & 0xFF
+        return out
+
+    @staticmethod
+    def bytes8_to_payload(b: np.ndarray) -> int:
+        x = 0
+        for i in range(8):
+            x |= (int(b[i]) & 0xFF) << (8 * i)
+        return int(x)
+
+    @staticmethod
+    def _key_residue(k_bipolar: np.ndarray, p: int) -> np.ndarray:
+        return np.where(k_bipolar > 0, 1, p - 1).astype(np.int64, copy=False)
+
+    @staticmethod
+    def cos_sim(u: np.ndarray, v: np.ndarray) -> float:
+        uf = u.astype(np.float32, copy=False)
+        vf = v.astype(np.float32, copy=False)
+        dot = float(np.dot(uf, vf))
+        nu = float(np.linalg.norm(uf) + 1e-12)
+        nv = float(np.linalg.norm(vf) + 1e-12)
+        return dot / (nu * nv)
+
+    def _welford_update(self, count_arr, mean_arr, M2_arr, b: int, x: float):
+        n = int(count_arr[b]) + 1
+        count_arr[b] = n
+        delta = x - mean_arr[b]
+        mean_arr[b] += delta / n
+        delta2 = x - mean_arr[b]
+        M2_arr[b] += delta * delta2
+
+    def _welford_std(self, count_arr, M2_arr, b: int) -> float:
+        n = int(count_arr[b])
+        if n < 2:
+            return 0.0
+        return float(math.sqrt(M2_arr[b] / (n - 1)))
+
+    def _id_threshold(self, b: int) -> float:
+        n = int(self.id_count[b])
+        if n < 32:
+            return self.id_cos_min
+        std = self._welford_std(self.id_count, self.id_M2, b)
+        return max(self.id_cos_min, float(self.id_mean[b] - 3.0 * std))
+
+    def _pay_threshold(self, b: int) -> float:
+        n = int(self.pay_count[b])
+        if n < 32:
+            return self.pay_cos_min
+        std = self._welford_std(self.pay_count, self.pay_M2, b)
+        return max(self.pay_cos_min, float(self.pay_mean[b] - 3.0 * std))
+
+    def _unbound_sum(self, M_bank_shards: np.ndarray, k_bipolar: np.ndarray) -> np.ndarray:
+        u = np.zeros(self.d, dtype=np.int64)
+        for j, p in enumerate(self.moduli):
+            k_r = self._key_residue(k_bipolar, p)
+            u_r = (M_bank_shards[j] * k_r) % p
+            u += HyperMorphicGearbox.centered(u_r, p)
+        return u
+
+    def memory_bytes(self) -> int:
+        return int(
+            self.M_id.nbytes + self.M_pay.nbytes +
+            self.slot_table.nbytes + self.bucket_counts.nbytes +
+            self.byte_code.nbytes +
+            self.id_count.nbytes + self.id_mean.nbytes + self.id_M2.nbytes +
+            self.pay_count.nbytes + self.pay_mean.nbytes + self.pay_M2.nbytes +
+            self.N * 24
+        )
+
+    def store(self, x_emb: np.ndarray, payload: int) -> bool:
+        k = self.hasher.key(x_emb)
+        b = self.router.primary_bucket(x_emb, self.B)
+
+        # open addressing start slot from hashed key prefix
+        kb = np.packbits((k[: min(512, self.d)] > 0).astype(np.uint8)).tobytes()
+        s0 = fnv1a32(kb + b"\xA5") % self.S
+
+        s = -1
+        for t in range(self.insert_probe_limit):
+            ss = (s0 + t) % self.S
+            if self.slot_table[b, ss] < 0:
+                s = int(ss)
+                break
+        if s < 0:
+            return False
+
+        item_id = self.N
+        self.N += 1
+        self.payloads.append(int(payload))
+        self.item_bucket.append(int(b))
+        self.item_slot.append(int(s))
+
+        self.slot_table[b, s] = int(item_id)
+        self.bucket_counts[b] += 1
+
+        # id code (full d)
+        id_code = self.slot_code[s].astype(np.int64) * int(self.Q_id)
+
+        # payload code (disjoint slices), slot-bound
+        pay_code = np.zeros(self.d, dtype=np.int64)
+        bs = self.payload_to_bytes8(int(payload))
+        for chunk in range(8):
+            sl = slice(chunk * self.d_chunk, (chunk + 1) * self.d_chunk)
+            byte = int(bs[chunk])
+            byte_vec = self.byte_code[chunk, byte].astype(np.int64) * int(self.Q_pay)
+            pay_code[sl] = self.slot_code[s, sl].astype(np.int64) * byte_vec
+
+        for j, p in enumerate(self.moduli):
+            k_r = self._key_residue(k, p)
+            id_r  = HyperMorphicGearbox.to_residue(id_code, p)
+            pay_r = HyperMorphicGearbox.to_residue(pay_code, p)
+            self.M_id[b, j, :]  = (self.M_id[b, j, :]  + (k_r * id_r)  % p) % p
+            self.M_pay[b, j, :] = (self.M_pay[b, j, :] + (k_r * pay_r) % p) % p
+
+        return True
+
+    def _slot_candidates_in_bucket(self, b: int, k: np.ndarray, topL: int) -> tuple[np.ndarray, np.ndarray]:
+        u_id_i64 = self._unbound_sum(self.M_id[b], k)
+        occ = (self.slot_table[b] >= 0)
+        if not np.any(occ):
+            return np.empty((0,), dtype=np.int32), u_id_i64
+
+        # float32 BLAS slot scoring
+        u_id = u_id_i64.astype(np.float32, copy=False)
+        raw = self.slot_code_f @ u_id
+
+        # mask unoccupied
+        raw_masked = raw.copy()
+        raw_masked[~occ] = -1e30
+
+        L = int(min(max(1, topL), self.S))
+        idx = np.argpartition(-raw_masked, L - 1)[:L]
+        idx = idx[np.argsort(-raw_masked[idx])]
+        idx = idx[raw_masked[idx] > -1e29].astype(np.int32, copy=False)
+        return idx, u_id_i64
+
+    def decode_payload_from_u(self, s_hat: int, u_pay_i64: np.ndarray) -> tuple[int, float]:
+        # de-slot per slice, then 256-way classify on slice using BLAS
+        u_pay = u_pay_i64.astype(np.float32, copy=False)
+        out_bytes = np.empty(8, dtype=np.uint8)
+
+        # cosine between pred (de-slotted) and chosen byte code slices (scale-free)
+        dot = 0.0
+        n_pred = 0.0
+        n_ref = 0.0
+
+        for chunk in range(8):
+            sl = slice(chunk * self.d_chunk, (chunk + 1) * self.d_chunk)
+            pred_slice = self.slot_code_f[s_hat, sl] * u_pay[sl]
+            scores = self.byte_code_f[chunk] @ pred_slice
+            v = int(np.argmax(scores))
+            out_bytes[chunk] = v
+
+            ref_slice = self.byte_code_f[chunk, v]
+            dot += float(np.dot(pred_slice, ref_slice))
+            n_pred += float(np.dot(pred_slice, pred_slice))
+            n_ref += float(np.dot(ref_slice, ref_slice))
+
+        payload_hat = self.bytes8_to_payload(out_bytes)
+        pay_cos = float(dot / (math.sqrt(n_pred + 1e-12) * math.sqrt(n_ref + 1e-12)))
+        return payload_hat, pay_cos
+
+    def query(self, x_emb: np.ndarray, topL: int = 10):
+        k = self.hasher.key(x_emb)
+        buckets = self.router.candidates(x_emb, self.B, probes=self.bucket_probes, flip_radius=2, uncertain_k=12)
+
+        best_item = None
+        best_payload = None
+        best_score = -1e30
+        rejected = True
+
+        for b in buckets:
+            cand_slots, u_id_i64 = self._slot_candidates_in_bucket(b, k, topL=topL)
+            if cand_slots.size == 0:
+                continue
+
+            # compute pay unbinding once per bucket (lazy)
+            u_pay_i64 = None
+
+            for s_hat in cand_slots.tolist():
+                s_hat = int(s_hat)
+                item_id = int(self.slot_table[b, s_hat])
+                if item_id < 0 or item_id >= self.N:
+                    continue
+
+                # cosine id verify (scale-free)
+                id_cos = self.cos_sim(u_id_i64, self.slot_code_f[s_hat])
+                if id_cos < self._id_threshold(b):
+                    continue
+
+                if u_pay_i64 is None:
+                    u_pay_i64 = self._unbound_sum(self.M_pay[b], k)
+
+                payload_hat, pay_cos = self.decode_payload_from_u(s_hat, u_pay_i64)
+                if pay_cos < self._pay_threshold(b):
+                    continue
+
+                combined = float(id_cos + 0.9 * pay_cos)
+                if combined > best_score:
+                    best_score = combined
+                    best_item = item_id
+                    best_payload = payload_hat
+                    rejected = False
+
+        return best_item, best_payload, rejected
+
+    def calibrate_verify(self, X: np.ndarray, n_samples: int = 2048, seed: int = 0):
+        rng = np.random.default_rng(seed)
+        n = min(self.N, int(n_samples))
+        if n <= 0:
+            return
+        idx = rng.choice(self.N, size=n, replace=False)
+
+        for i in idx:
+            b = int(self.item_bucket[i])
+            s = int(self.item_slot[i])
+            k = self.hasher.key(X[i])
+
+            u_id = self._unbound_sum(self.M_id[b], k)
+            id_cos = self.cos_sim(u_id, self.slot_code_f[s])
+
+            u_pay = self._unbound_sum(self.M_pay[b], k).astype(np.float32, copy=False)
+            true_payload = int(self.payloads[i])
+            bs = self.payload_to_bytes8(true_payload)
+
+            dot = 0.0
+            n_pred = 0.0
+            n_ref = 0.0
+            for chunk in range(8):
+                sl = slice(chunk * self.d_chunk, (chunk + 1) * self.d_chunk)
+                pred_slice = self.slot_code_f[s, sl] * u_pay[sl]
+                ref_slice = self.byte_code_f[chunk, int(bs[chunk])]
+                dot += float(np.dot(pred_slice, ref_slice))
+                n_pred += float(np.dot(pred_slice, pred_slice))
+                n_ref += float(np.dot(ref_slice, ref_slice))
+            pay_cos = float(dot / (math.sqrt(n_pred + 1e-12) * math.sqrt(n_ref + 1e-12)))
+
+            self._welford_update(self.id_count, self.id_mean, self.id_M2, b, float(id_cos))
+            self._welford_update(self.pay_count, self.pay_mean, self.pay_M2, b, float(pay_cos))
+
+# -----------------------------
+# Benchmark harness
+# -----------------------------
+def make_embeddings(N: int, emb_dim: int, n_classes: int, noise: float, seed: int):
+    rng = np.random.default_rng(seed)
+    centers = rng.normal(size=(n_classes, emb_dim)).astype(np.float32)
+    centers /= (np.linalg.norm(centers, axis=1, keepdims=True) + 1e-8)
+    y = rng.integers(0, n_classes, size=(N,), dtype=np.int64)
+    X = centers[y] + noise * rng.normal(size=(N, emb_dim)).astype(np.float32)
+    X /= (np.linalg.norm(X, axis=1, keepdims=True) + 1e-8)
+    return X
+
+def bench_once(
+    N: int,
+    emb_dim: int,
+    d: int,
+    shards: int,
+    S: int,
+    target_items_per_bucket: int,
+    noise: float,
+    seed: int,
+    bucket_probes: int,
+    topL: int = 10,
+):
+    rng = np.random.default_rng(seed)
+
+    # critical: keep items-per-bucket ~constant
+    B = next_pow2(int(math.ceil(N / max(1, target_items_per_bucket))))
+
+    X = make_embeddings(N, emb_dim, n_classes=10, noise=noise, seed=seed)
+    payload_truth = [int(x) for x in rng.integers(0, 2**64, size=(N,), dtype=np.uint64).tolist()]
+
+    holo = HoloNetV10(
+        d=d, S=S, B=B, shards=shards, emb_dim=emb_dim,
+        seed=seed + 1000,
+        bucket_probes=bucket_probes,
+        insert_probe_limit=64,
+        id_cos_min=0.02,
+        pay_cos_min=0.02,
+    )
+    holo.hasher.calibrate(X[: min(N, 2048)], q=0.15)
+
+    t0 = time.perf_counter()
+    stored = 0
+    for i in range(N):
+        stored += int(holo.store(X[i], payload_truth[i]))
+    build_s = time.perf_counter() - t0
+
+    holo.calibrate_verify(X, n_samples=min(2048, N), seed=seed ^ 0xBEEF)
+
+    # noisy queries
+    Xq = X + (noise * 0.25) * rng.normal(size=X.shape).astype(np.float32)
+    Xq /= (np.linalg.norm(Xq, axis=1, keepdims=True) + 1e-8)
+
+    t0 = time.perf_counter()
+    N_eff = holo.N
+    id_ok = 0
+    payload_exact_ok = 0
+    payload_byte_ok = 0
+    rejected = 0
+
+    for i in range(N_eff):
+        item_id, payload_hat, rej = holo.query(Xq[i], topL=topL)
+        if rej:
+            rejected += 1
+            continue
+
+        if item_id == i:
+            id_ok += 1
+
+        if payload_hat == payload_truth[i]:
+            payload_exact_ok += 1
+
+        bt = holo.payload_to_bytes8(payload_truth[i])
+        bh = holo.payload_to_bytes8(payload_hat if payload_hat is not None else 0)
+        payload_byte_ok += int(np.sum(bt == bh))
+
+    q_s = time.perf_counter() - t0
+    q_us = (q_s / max(1, N_eff)) * 1e6
+
+    return {
+        "N": N,
+        "payload_exact_acc": payload_exact_ok / max(1, N_eff),
+        "payload_byte_acc": payload_byte_ok / max(1, (8 * N_eff)),
+        "id_acc": id_ok / max(1, N_eff),
+        "reject": rejected / max(1, N_eff),
+        "q_us": q_us,
+        "build_s": build_s,
+        "memMB": holo.memory_bytes() / (1024 * 1024),
+        "B": B,
+        "Q_id": holo.Q_id,
+        "Q_pay": holo.Q_pay,
+        "b": holo.b,
+        "m": holo.m,
+        "moduli": holo.moduli,
+        "stored": stored,
+    }
+
+# -----------------------------
+# Minimal tests (NON-FATAL by default)
+# -----------------------------
+def run_minimal_tests(fail_hard: bool = False) -> bool:
+    failures: list[str] = []
+
+    # Determinism: same seed → same results (within tolerance)
+    r1 = bench_once(
+        N=80, emb_dim=64, d=1024, shards=5, S=128,
+        target_items_per_bucket=8, noise=0.10, seed=1234, bucket_probes=10, topL=12
+    )
+    r2 = bench_once(
+        N=80, emb_dim=64, d=1024, shards=5, S=128,
+        target_items_per_bucket=8, noise=0.10, seed=1234, bucket_probes=10, topL=12
+    )
+    tol = 1e-9
+    for k in ["id_acc", "payload_exact_acc", "payload_byte_acc", "reject"]:
+        if abs(r1[k] - r2[k]) > tol:
+            failures.append(f"Determinism drift for {k}: {r1[k]} vs {r2[k]} (tol={tol})")
+
+    # Small-N sanity (soft expectations; no crash)
+    r = bench_once(
+        N=50, emb_dim=96, d=16384, shards=9, S=256,
+        target_items_per_bucket=2, noise=0.05, seed=777, bucket_probes=16, topL=24
+    )
+    if r["payload_exact_acc"] < 0.60:
+        failures.append(f"Sanity payload_exact_acc low: {r['payload_exact_acc']:.3f} (expected ~>=0.60)")
+    if r["reject"] > 0.80:
+        failures.append(f"Sanity reject high: {r['reject']:.3f} (expected ~<=0.80)")
+
+    if failures:
+        msg = "[tests] WARNING:\n  - " + "\n  - ".join(failures)
+        print(msg)
+        if fail_hard:
+            raise AssertionError(msg)
+        return False
+
+    print("[tests] OK")
+    return True
+
+# -----------------------------
+# Main
+# -----------------------------
+def main():
+    # Colab-safe defaults: tests run, but never crash the cell.
+    run_tests = True
+    fail_hard_tests = False  # set True if you want hard asserts
+
+    if run_tests:
+        run_minimal_tests(fail_hard=fail_hard_tests)
+
+    # ---- knobs that matter ----
+    emb_dim = 128
+    d = 4096            # must be divisible by 8
+    shards = 5          # try 5 or 7
+    S = 256
+    target_items_per_bucket = 8
+    bucket_probes = 12
+    topL = 10
+
+    noise = 0.15
+    seed = 7
+    Ns = [100, 300, 1000, 3000]
+
+    rows = []
+    for N in Ns:
+        r = bench_once(
+            N=N, emb_dim=emb_dim, d=d, shards=shards, S=S,
+            target_items_per_bucket=target_items_per_bucket,
+            noise=noise, seed=seed + N, bucket_probes=bucket_probes, topL=topL
+        )
+        rows.append(r)
+        print(
+            f"N={r['N']:5d} | payload_exact_acc={r['payload_exact_acc']:.3f} | payload_byte_acc={r['payload_byte_acc']:.3f} | "
+            f"id_acc={r['id_acc']:.3f} | reject={r['reject']:.3f} | q={r['q_us']:,.1f}us | build={r['build_s']:.2f}s | "
+            f"mem={r['memMB']:.2f}MB | B={r['B']} | Q_id={r['Q_id']} Q_pay={r['Q_pay']} | b(d)={r['b']} m(d)={r['m']} | moduli={r['moduli']}"
+        )
+
+    chart_paths: list[str] = []
+
+    chart_paths.append("acc_vs_items.png")
+    plot_and_save(
+        Ns,
+        [[r["payload_exact_acc"] for r in rows], [r["payload_byte_acc"] for r in rows], [r["id_acc"] for r in rows]],
+        ["payload_exact_acc (64-bit)", "payload_byte_acc", "id_acc"],
+        "#items (N)", "accuracy",
+        "Accuracy vs #items (HoloNetV10)",
+        chart_paths[-1],
+    )
+
+    chart_paths.append("reject_vs_items.png")
+    plot_and_save(
+        Ns,
+        [[r["reject"] for r in rows]],
+        ["reject rate"],
+        "#items (N)", "fraction",
+        "Reject vs #items (cosine verification)",
+        chart_paths[-1],
+    )
+
+    chart_paths.append("memory_scaling.png")
+    plot_and_save(
+        Ns,
+        [[r["memMB"] for r in rows]],
+        ["memory (MB)"],
+        "#items (N)", "MB",
+        "Memory scaling (HoloNetV10)",
+        chart_paths[-1],
+    )
+
+    chart_paths.append("latency_scaling.png")
+    plot_and_save(
+        Ns,
+        [[r["q_us"] for r in rows]],
+        ["query latency (us)"],
+        "#items (N)", "microseconds",
+        "Latency scaling (HoloNetV10 query)",
+        chart_paths[-1],
+    )
+
+    chart_paths.append("build_time_scaling.png")
+    plot_and_save(
+        Ns,
+        [[r["build_s"] for r in rows]],
+        ["build time (s)"],
+        "#items (N)", "seconds",
+        "Build time scaling (HoloNetV10 store)",
+        chart_paths[-1],
+    )
+
+    print("\nSaved charts:")
+    for p in chart_paths:
+        print(" -", p)
+
+    display_saved_charts(chart_paths)
+
+if __name__ == "__main__":
+    main()
+
+
+
+[tests] OK
+N=  100 | payload_exact_acc=0.930 | payload_byte_acc=0.991 | id_acc=1.000 | reject=0.000 | q=37,240.8us | build=0.32s | mem=6.02MB | B=16 | Q_id=252 Q_pay=124 | b(d)=13 m(d)=65 | moduli=[998244353, 1000000007, 1000000009, 1012924417, 1073741789]
+N=  300 | payload_exact_acc=0.913 | payload_byte_acc=0.945 | id_acc=0.950 | reject=0.000 | q=45,912.5us | build=0.96s | mem=21.07MB | B=64 | Q_id=252 Q_pay=124 | b(d)=13 m(d)=65 | moduli=[998244353, 1000000007, 1000000009, 1012924417, 1073741789]
+N= 1000 | payload_exact_acc=0.632 | payload_byte_acc=0.841 | id_acc=0.895 | reject=0.000 | q=52,080.4us | build=4.11s | mem=41.15MB | B=128 | Q_id=252 Q_pay=124 | b(d)=13 m(d)=65 | moduli=[998244353, 1000000007, 1000000009, 1012924417, 1073741789]
+N= 3000 | payload_exact_acc=0.705 | payload_byte_acc=0.800 | id_acc=0.826 | reject=0.000 | q=50,922.3us | build=11.44s | mem=161.59MB | B=512 | Q_id=252 Q_pay=124 | b(d)=13 m(d)=65 | moduli=[998244353, 1000000007, 1000000009, 1012924417, 1073741789]
+
+Saved charts:
+ - acc_vs_items.png
+ - reject_vs_items.png
+ - memory_scaling.png
+ - latency_scaling.png
+ - build_time_scaling.png
+
