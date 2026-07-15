@@ -1,0 +1,1097 @@
+"""HoloRAID Secure v2 — single-file GitHub edition.
+
+Authenticated, confidential CRT threshold erasure coding.
+
+Security model
+--------------
+* Payload confidentiality: ChaCha20-Poly1305 with a random 256-bit data key.
+* Threshold key release: Shamir sharing over the Mersenne prime 2**521 - 1.
+* Erasure coding: CRT residues under distinct 61-bit prime moduli.
+* Shard authenticity: Ed25519 signatures verified against a trusted manifest.
+* Bit-rot / tamper handling: invalid shards are rejected before recovery.
+* Replay / cross-dataset mixing: a random dataset id is signed into every shard.
+
+Plaintext confidentiality and shard-rewrite protection
+-------------------------------------------------
+The plaintext is encrypted with ChaCha20-Poly1305 before any residue is emitted.
+Every shard is signed with Ed25519. A rewritten shard fails signature validation,
+and an attacker-supplied replacement manifest fails against the separately trusted
+public-key fingerprint. The data-encryption key is released only from k valid
+Shamir shares.
+
+Install and run
+---------------
+    python -m pip install cryptography
+    python holoraid_secure_github.py self-test
+    python holoraid_secure_github.py encode input.bin vault --signing-key signer.key
+    python holoraid_secure_github.py decode vault restored.bin --trust-anchor <SHA256>
+
+The trust fingerprint must be retained outside the shard directory. This is a
+research-grade reference implementation and has not been externally audited.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+from hashlib import sha256
+from itertools import combinations
+import math
+import secrets
+import struct
+from time import perf_counter
+from typing import Iterable, Optional, Sequence
+
+from cryptography.exceptions import InvalidSignature, InvalidTag
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+
+VERSION = 2
+SHARD_MAGIC = b"HRS2"
+MANIFEST_MAGIC = b"HRM2"
+SHAMIR_PRIME = 2**521 - 1
+KEY_BYTES = 32
+KEY_SHARE_BYTES = 66
+SIGNATURE_BYTES = 64
+NONCE_BYTES = 12
+DATASET_ID_BYTES = 16
+HASH_BYTES = 32
+
+
+class HoloRAIDError(Exception):
+    """Base exception."""
+
+
+class ConfigurationError(HoloRAIDError):
+    """Invalid n/k or capacity configuration."""
+
+
+class IntegrityError(HoloRAIDError):
+    """Manifest, signature, metadata, or AEAD validation failed."""
+
+
+class ThresholdError(HoloRAIDError):
+    """Too few acceptable shards remain for recovery."""
+
+
+def _is_probable_prime_64(n: int) -> bool:
+    """Deterministic Miller-Rabin for unsigned 64-bit integers."""
+    if n < 2:
+        return False
+    small_primes = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
+    for p in small_primes:
+        if n % p == 0:
+            return n == p
+
+    d = n - 1
+    s = 0
+    while d % 2 == 0:
+        s += 1
+        d //= 2
+
+    # Deterministic for n < 2**64.
+    for a in (2, 325, 9375, 28178, 450775, 9780504, 1795265022):
+        if a % n == 0:
+            continue
+        x = pow(a, d, n)
+        if x in (1, n - 1):
+            continue
+        for _ in range(s - 1):
+            x = pow(x, 2, n)
+            if x == n - 1:
+                break
+        else:
+            return False
+    return True
+
+
+def _generate_primes(count: int, start: int = 2**61 - 1) -> tuple[int, ...]:
+    if count <= 0:
+        raise ConfigurationError("prime count must be positive")
+    if start >= 2**64 - 2:
+        raise ConfigurationError("prime start must leave room below 2**64")
+    candidate = start if start % 2 else start + 1
+    primes: list[int] = []
+    while len(primes) < count:
+        if _is_probable_prime_64(candidate):
+            primes.append(candidate)
+        candidate += 2
+        if candidate >= 2**64:
+            raise ConfigurationError("ran out of 64-bit prime space")
+    return tuple(primes)
+
+
+def _shamir_split(secret: int, n: int, k: int) -> list[tuple[int, int]]:
+    if not (0 <= secret < SHAMIR_PRIME):
+        raise ConfigurationError("secret is outside the Shamir field")
+    coefficients = [secret] + [secrets.randbelow(SHAMIR_PRIME) for _ in range(k - 1)]
+    shares: list[tuple[int, int]] = []
+    for x in range(1, n + 1):
+        y = 0
+        x_power = 1
+        for coefficient in coefficients:
+            y = (y + coefficient * x_power) % SHAMIR_PRIME
+            x_power = (x_power * x) % SHAMIR_PRIME
+        shares.append((x, y))
+    return shares
+
+
+def _shamir_recover(shares: Sequence[tuple[int, int]]) -> int:
+    """Lagrange interpolation at x=0."""
+    if not shares:
+        raise ThresholdError("no key shares supplied")
+    xs = [x for x, _ in shares]
+    if len(xs) != len(set(xs)):
+        raise IntegrityError("duplicate Shamir x-coordinate")
+
+    secret = 0
+    for i, (x_i, y_i) in enumerate(shares):
+        numerator = 1
+        denominator = 1
+        for j, (x_j, _) in enumerate(shares):
+            if i == j:
+                continue
+            numerator = (numerator * (-x_j)) % SHAMIR_PRIME
+            denominator = (denominator * (x_i - x_j)) % SHAMIR_PRIME
+        lagrange = numerator * pow(denominator, -1, SHAMIR_PRIME)
+        secret = (secret + y_i * lagrange) % SHAMIR_PRIME
+    return secret
+
+
+def _aad(dataset_id: bytes, n: int, k: int, plaintext_len: int) -> bytes:
+    return b"HoloRAID-Secure-v2\x00" + dataset_id + struct.pack(">HHQ", n, k, plaintext_len)
+
+
+def _crt_plan(moduli: Sequence[int]) -> tuple[int, tuple[int, ...]]:
+    modulus_product = math.prod(moduli)
+    coefficients = []
+    for modulus in moduli:
+        partial = modulus_product // modulus
+        coefficients.append(partial * pow(partial, -1, modulus))
+    return modulus_product, tuple(coefficients)
+
+
+def _crt_from_plan(
+    residues: Sequence[int], modulus_product: int, coefficients: Sequence[int]
+) -> int:
+    return sum(r * c for r, c in zip(residues, coefficients)) % modulus_product
+
+
+def _random_gear(modulus: int) -> int:
+    # modulus is prime, so every value 1..modulus-1 is invertible.
+    return secrets.randbelow(modulus - 2) + 2
+
+
+@dataclass(frozen=True)
+class Shard:
+    n: int
+    k: int
+    index: int
+    dataset_id: bytes
+    modulus: int
+    gear: int
+    chunk_size: int
+    num_chunks: int
+    plaintext_len: int
+    ciphertext_len: int
+    key_x: int
+    key_y: int
+    residues: tuple[int, ...]
+    signature: bytes = b""
+
+    _HEADER = struct.Struct(">4sBHHH16sQQHIQQH66s")
+
+    def _unsigned_bytes(self) -> bytes:
+        if len(self.dataset_id) != DATASET_ID_BYTES:
+            raise IntegrityError("dataset id must be 16 bytes")
+        if len(self.residues) != self.num_chunks:
+            raise IntegrityError("residue count does not match num_chunks")
+        if not (0 <= self.key_y < SHAMIR_PRIME):
+            raise IntegrityError("invalid Shamir share")
+        header = self._HEADER.pack(
+            SHARD_MAGIC,
+            VERSION,
+            self.n,
+            self.k,
+            self.index,
+            self.dataset_id,
+            self.modulus,
+            self.gear,
+            self.chunk_size,
+            self.num_chunks,
+            self.plaintext_len,
+            self.ciphertext_len,
+            self.key_x,
+            self.key_y.to_bytes(KEY_SHARE_BYTES, "big"),
+        )
+        payload = b"".join(struct.pack(">Q", residue) for residue in self.residues)
+        return header + payload
+
+    def sign(self, private_key: Ed25519PrivateKey) -> "Shard":
+        signature = private_key.sign(self._unsigned_bytes())
+        return replace(self, signature=signature)
+
+    def verify(self, public_key: Ed25519PublicKey) -> bool:
+        if len(self.signature) != SIGNATURE_BYTES:
+            return False
+        try:
+            public_key.verify(self.signature, self._unsigned_bytes())
+            return True
+        except (InvalidSignature, ValueError, IntegrityError):
+            return False
+
+    def to_bytes(self) -> bytes:
+        if len(self.signature) != SIGNATURE_BYTES:
+            raise IntegrityError("cannot serialize an unsigned shard")
+        return self._unsigned_bytes() + self.signature
+
+    @classmethod
+    def from_bytes(cls, blob: bytes) -> "Shard":
+        minimum = cls._HEADER.size + SIGNATURE_BYTES
+        if len(blob) < minimum:
+            raise IntegrityError("truncated shard")
+        unpacked = cls._HEADER.unpack(blob[: cls._HEADER.size])
+        (
+            magic,
+            version,
+            n,
+            k,
+            index,
+            dataset_id,
+            modulus,
+            gear,
+            chunk_size,
+            num_chunks,
+            plaintext_len,
+            ciphertext_len,
+            key_x,
+            key_y_bytes,
+        ) = unpacked
+        if magic != SHARD_MAGIC or version != VERSION:
+            raise IntegrityError("unsupported shard format")
+        expected = cls._HEADER.size + num_chunks * 8 + SIGNATURE_BYTES
+        if len(blob) != expected:
+            raise IntegrityError("shard length does not match header")
+        offset = cls._HEADER.size
+        residues = tuple(
+            struct.unpack(">Q", blob[offset + i * 8 : offset + (i + 1) * 8])[0]
+            for i in range(num_chunks)
+        )
+        signature = blob[-SIGNATURE_BYTES:]
+        return cls(
+            n=n,
+            k=k,
+            index=index,
+            dataset_id=dataset_id,
+            modulus=modulus,
+            gear=gear,
+            chunk_size=chunk_size,
+            num_chunks=num_chunks,
+            plaintext_len=plaintext_len,
+            ciphertext_len=ciphertext_len,
+            key_x=key_x,
+            key_y=int.from_bytes(key_y_bytes, "big"),
+            residues=residues,
+            signature=signature,
+        )
+
+
+@dataclass(frozen=True)
+class Manifest:
+    n: int
+    k: int
+    dataset_id: bytes
+    plaintext_len: int
+    ciphertext_len: int
+    chunk_size: int
+    num_chunks: int
+    nonce: bytes
+    ciphertext_sha256: bytes
+    public_key: bytes
+    moduli: tuple[int, ...]
+    gears: tuple[int, ...]
+    signature: bytes = b""
+
+    _HEADER = struct.Struct(">4sBHH16sQQHI12s32s32s")
+
+    def _unsigned_bytes(self) -> bytes:
+        if len(self.dataset_id) != DATASET_ID_BYTES:
+            raise IntegrityError("dataset id must be 16 bytes")
+        if len(self.nonce) != NONCE_BYTES:
+            raise IntegrityError("nonce must be 12 bytes")
+        if len(self.ciphertext_sha256) != HASH_BYTES:
+            raise IntegrityError("ciphertext hash must be 32 bytes")
+        if len(self.public_key) != 32:
+            raise IntegrityError("Ed25519 public key must be 32 bytes")
+        if len(self.moduli) != self.n or len(self.gears) != self.n:
+            raise IntegrityError("manifest modulus/gear count mismatch")
+        header = self._HEADER.pack(
+            MANIFEST_MAGIC,
+            VERSION,
+            self.n,
+            self.k,
+            self.dataset_id,
+            self.plaintext_len,
+            self.ciphertext_len,
+            self.chunk_size,
+            self.num_chunks,
+            self.nonce,
+            self.ciphertext_sha256,
+            self.public_key,
+        )
+        vectors = b"".join(struct.pack(">Q", value) for value in self.moduli + self.gears)
+        return header + vectors
+
+    def sign(self, private_key: Ed25519PrivateKey) -> "Manifest":
+        return replace(self, signature=private_key.sign(self._unsigned_bytes()))
+
+    def verify(self, expected_trust_anchor: Optional[str] = None) -> None:
+        if len(self.signature) != SIGNATURE_BYTES:
+            raise IntegrityError("manifest is unsigned")
+        if expected_trust_anchor is not None and self.trust_anchor() != expected_trust_anchor:
+            raise IntegrityError("manifest public key does not match trusted fingerprint")
+        try:
+            Ed25519PublicKey.from_public_bytes(self.public_key).verify(
+                self.signature, self._unsigned_bytes()
+            )
+        except (InvalidSignature, ValueError) as exc:
+            raise IntegrityError("manifest signature verification failed") from exc
+
+    def trust_anchor(self) -> str:
+        return sha256(self.public_key).hexdigest()
+
+    def to_bytes(self) -> bytes:
+        if len(self.signature) != SIGNATURE_BYTES:
+            raise IntegrityError("cannot serialize an unsigned manifest")
+        return self._unsigned_bytes() + self.signature
+
+    @classmethod
+    def from_bytes(cls, blob: bytes) -> "Manifest":
+        minimum = cls._HEADER.size + SIGNATURE_BYTES
+        if len(blob) < minimum:
+            raise IntegrityError("truncated manifest")
+        unpacked = cls._HEADER.unpack(blob[: cls._HEADER.size])
+        (
+            magic,
+            version,
+            n,
+            k,
+            dataset_id,
+            plaintext_len,
+            ciphertext_len,
+            chunk_size,
+            num_chunks,
+            nonce,
+            ciphertext_hash,
+            public_key,
+        ) = unpacked
+        if magic != MANIFEST_MAGIC or version != VERSION:
+            raise IntegrityError("unsupported manifest format")
+        expected = cls._HEADER.size + (2 * n * 8) + SIGNATURE_BYTES
+        if len(blob) != expected:
+            raise IntegrityError("manifest length does not match header")
+        offset = cls._HEADER.size
+        numbers = tuple(
+            struct.unpack(">Q", blob[offset + i * 8 : offset + (i + 1) * 8])[0]
+            for i in range(2 * n)
+        )
+        return cls(
+            n=n,
+            k=k,
+            dataset_id=dataset_id,
+            plaintext_len=plaintext_len,
+            ciphertext_len=ciphertext_len,
+            chunk_size=chunk_size,
+            num_chunks=num_chunks,
+            nonce=nonce,
+            ciphertext_sha256=ciphertext_hash,
+            public_key=public_key,
+            moduli=numbers[:n],
+            gears=numbers[n:],
+            signature=blob[-SIGNATURE_BYTES:],
+        )
+
+
+@dataclass(frozen=True)
+class Bundle:
+    manifest: Manifest
+    shards: tuple[Shard, ...]
+
+    @property
+    def trust_anchor(self) -> str:
+        return self.manifest.trust_anchor()
+
+    @property
+    def serialized_size(self) -> int:
+        return len(self.manifest.to_bytes()) + sum(len(shard.to_bytes()) for shard in self.shards)
+
+
+@dataclass(frozen=True)
+class RecoveryReport:
+    valid_indices: tuple[int, ...]
+    rejected: tuple[tuple[int, str], ...]
+    used_indices: tuple[int, ...]
+    subset_trials: int
+    elapsed_seconds: float
+
+
+class HoloRAIDSecure:
+    """Authenticated, encrypted CRT threshold erasure coding."""
+
+    def __init__(
+        self,
+        n: int = 10,
+        k: int = 6,
+        *,
+        prime_start: int = 2**61 - 1,
+        signing_key: Optional[Ed25519PrivateKey] = None,
+        max_subset_trials: int = 10_000,
+    ) -> None:
+        if not (1 <= k <= n <= 255):
+            raise ConfigurationError("require 1 <= k <= n <= 255")
+        self.n = n
+        self.k = k
+        self.moduli = _generate_primes(n, prime_start)
+        threshold_product = math.prod(sorted(self.moduli)[:k])
+        self.chunk_size = max(1, (threshold_product.bit_length() - 1) // 8)
+        if 1 << (8 * self.chunk_size) > threshold_product:
+            raise ConfigurationError("internal chunk-size capacity calculation failed")
+        self._signing_key = signing_key or Ed25519PrivateKey.generate()
+        self.max_subset_trials = max_subset_trials
+
+    @property
+    def public_key_bytes(self) -> bytes:
+        return self._signing_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+
+    @property
+    def ideal_residue_overhead(self) -> float:
+        """Approximate payload-only storage factor, excluding metadata and signatures."""
+        return (self.n * 8) / self.chunk_size
+
+    def encode(self, plaintext: bytes) -> Bundle:
+        if not isinstance(plaintext, (bytes, bytearray, memoryview)):
+            raise TypeError("plaintext must be bytes-like")
+        plaintext = bytes(plaintext)
+        dataset_id = secrets.token_bytes(DATASET_ID_BYTES)
+        data_key = secrets.token_bytes(KEY_BYTES)
+        nonce = secrets.token_bytes(NONCE_BYTES)
+        aad = _aad(dataset_id, self.n, self.k, len(plaintext))
+        ciphertext = ChaCha20Poly1305(data_key).encrypt(nonce, plaintext, aad)
+        ciphertext_hash = sha256(ciphertext).digest()
+
+        num_chunks = math.ceil(len(ciphertext) / self.chunk_size)
+        padded = ciphertext.ljust(num_chunks * self.chunk_size, b"\x00")
+        chunk_values = tuple(
+            int.from_bytes(padded[i : i + self.chunk_size], "big")
+            for i in range(0, len(padded), self.chunk_size)
+        )
+
+        gears = tuple(_random_gear(modulus) for modulus in self.moduli)
+        key_secret = int.from_bytes(data_key, "big")
+        key_shares = _shamir_split(key_secret, self.n, self.k)
+
+        shards: list[Shard] = []
+        for index, (modulus, gear, (key_x, key_y)) in enumerate(
+            zip(self.moduli, gears, key_shares)
+        ):
+            residues = tuple((gear * (value % modulus)) % modulus for value in chunk_values)
+            shard = Shard(
+                n=self.n,
+                k=self.k,
+                index=index,
+                dataset_id=dataset_id,
+                modulus=modulus,
+                gear=gear,
+                chunk_size=self.chunk_size,
+                num_chunks=num_chunks,
+                plaintext_len=len(plaintext),
+                ciphertext_len=len(ciphertext),
+                key_x=key_x,
+                key_y=key_y,
+                residues=residues,
+            ).sign(self._signing_key)
+            shards.append(shard)
+
+        manifest = Manifest(
+            n=self.n,
+            k=self.k,
+            dataset_id=dataset_id,
+            plaintext_len=len(plaintext),
+            ciphertext_len=len(ciphertext),
+            chunk_size=self.chunk_size,
+            num_chunks=num_chunks,
+            nonce=nonce,
+            ciphertext_sha256=ciphertext_hash,
+            public_key=self.public_key_bytes,
+            moduli=self.moduli,
+            gears=gears,
+        ).sign(self._signing_key)
+        return Bundle(manifest=manifest, shards=tuple(shards))
+
+    @staticmethod
+    def _validate_shard_metadata(shard: Shard, manifest: Manifest) -> Optional[str]:
+        if not (0 <= shard.index < manifest.n):
+            return "index out of range"
+        expected = (
+            shard.n == manifest.n
+            and shard.k == manifest.k
+            and shard.dataset_id == manifest.dataset_id
+            and shard.modulus == manifest.moduli[shard.index]
+            and shard.gear == manifest.gears[shard.index]
+            and shard.chunk_size == manifest.chunk_size
+            and shard.num_chunks == manifest.num_chunks
+            and shard.plaintext_len == manifest.plaintext_len
+            and shard.ciphertext_len == manifest.ciphertext_len
+            and shard.key_x == shard.index + 1
+            and len(shard.residues) == manifest.num_chunks
+            and all(0 <= r < shard.modulus for r in shard.residues)
+        )
+        return None if expected else "metadata mismatch or cross-dataset replay"
+
+    def decode(
+        self,
+        manifest: Manifest,
+        shards: Iterable[Optional[Shard]],
+        *,
+        expected_trust_anchor: Optional[str] = None,
+    ) -> tuple[bytes, RecoveryReport]:
+        start = perf_counter()
+        manifest.verify(expected_trust_anchor)
+        public_key = Ed25519PublicKey.from_public_bytes(manifest.public_key)
+
+        valid_by_index: dict[int, Shard] = {}
+        rejected: list[tuple[int, str]] = []
+        for position, maybe_shard in enumerate(shards):
+            if maybe_shard is None:
+                rejected.append((position, "missing"))
+                continue
+            shard = maybe_shard
+            reason = self._validate_shard_metadata(shard, manifest)
+            if reason is not None:
+                rejected.append((shard.index, reason))
+                continue
+            if shard.index in valid_by_index:
+                rejected.append((shard.index, "duplicate index"))
+                continue
+            if not shard.verify(public_key):
+                rejected.append((shard.index, "invalid Ed25519 signature"))
+                continue
+            valid_by_index[shard.index] = shard
+
+        valid = tuple(valid_by_index[index] for index in sorted(valid_by_index))
+        if len(valid) < manifest.k:
+            raise ThresholdError(
+                f"need {manifest.k} valid shards; found {len(valid)} "
+                f"({len(rejected)} missing/rejected)"
+            )
+
+        subset_trials = 0
+        last_error: Optional[Exception] = None
+        for subset in combinations(valid, manifest.k):
+            subset_trials += 1
+            if subset_trials > self.max_subset_trials:
+                break
+            try:
+                secret = _shamir_recover([(s.key_x, s.key_y) for s in subset])
+                if secret >= 1 << (8 * KEY_BYTES):
+                    raise IntegrityError("reconstructed key is outside 256-bit range")
+                data_key = secret.to_bytes(KEY_BYTES, "big")
+
+                moduli = tuple(s.modulus for s in subset)
+                modulus_product, coefficients = _crt_plan(moduli)
+                inverse_gears = tuple(pow(s.gear, -1, s.modulus) for s in subset)
+
+                reconstructed = bytearray()
+                max_chunk_value = 1 << (8 * manifest.chunk_size)
+                for chunk_index in range(manifest.num_chunks):
+                    residues = tuple(
+                        (inverse * shard.residues[chunk_index]) % shard.modulus
+                        for shard, inverse in zip(subset, inverse_gears)
+                    )
+                    value = _crt_from_plan(residues, modulus_product, coefficients)
+                    if value >= max_chunk_value:
+                        raise IntegrityError("CRT candidate is outside chunk capacity")
+                    reconstructed.extend(value.to_bytes(manifest.chunk_size, "big"))
+
+                ciphertext = bytes(reconstructed[: manifest.ciphertext_len])
+                if sha256(ciphertext).digest() != manifest.ciphertext_sha256:
+                    raise IntegrityError("ciphertext hash mismatch")
+                plaintext = ChaCha20Poly1305(data_key).decrypt(
+                    manifest.nonce,
+                    ciphertext,
+                    _aad(
+                        manifest.dataset_id,
+                        manifest.n,
+                        manifest.k,
+                        manifest.plaintext_len,
+                    ),
+                )
+                if len(plaintext) != manifest.plaintext_len:
+                    raise IntegrityError("plaintext length mismatch")
+                report = RecoveryReport(
+                    valid_indices=tuple(s.index for s in valid),
+                    rejected=tuple(rejected),
+                    used_indices=tuple(s.index for s in subset),
+                    subset_trials=subset_trials,
+                    elapsed_seconds=perf_counter() - start,
+                )
+                return plaintext, report
+            except (IntegrityError, InvalidTag, ValueError) as exc:
+                last_error = exc
+                continue
+
+        detail = f": {last_error}" if last_error is not None else ""
+        raise IntegrityError(
+            f"no valid {manifest.k}-shard subset reconstructed the authenticated payload{detail}"
+        )
+
+
+def flip_residue_bit(shard: Shard, chunk_index: int = 0, bit: int = 0) -> Shard:
+    """Test helper: corrupt one wound residue without updating its signature."""
+    if not shard.residues:
+        raise ValueError("shard contains no residues")
+    chunk_index %= len(shard.residues)
+    values = list(shard.residues)
+    values[chunk_index] = (values[chunk_index] ^ (1 << bit)) % shard.modulus
+    return replace(shard, residues=tuple(values))
+
+
+__all__ = [
+    "Bundle",
+    "ConfigurationError",
+    "HoloRAIDError",
+    "HoloRAIDSecure",
+    "IntegrityError",
+    "Manifest",
+    "RecoveryReport",
+    "Shard",
+    "ThresholdError",
+    "flip_residue_bit",
+]
+
+
+# ---------------------------------------------------------------------------
+# Single-file command-line interface and executable verification suite
+# ---------------------------------------------------------------------------
+
+import argparse
+import json
+import os
+from pathlib import Path
+import random
+import tempfile
+
+from cryptography.hazmat.primitives.serialization import NoEncryption, PrivateFormat
+
+
+MANIFEST_FILENAME = "manifest.hrm2"
+SHARD_GLOB = "shard_*.hrs2"
+TRUST_ANCHOR_FILENAME = "TRUST_ANCHOR.txt"
+METADATA_FILENAME = "bundle_info.json"
+
+
+def _atomic_write(path: Path, data: bytes, *, mode: int = 0o644) -> None:
+    """Write bytes using a same-directory temporary file and atomic replace."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            temporary.unlink(missing_ok=True)
+        finally:
+            raise
+
+
+def _load_or_create_signing_key(path: Path) -> tuple[Ed25519PrivateKey, bool]:
+    """Load a raw 32-byte Ed25519 private key or create it with mode 0600."""
+    if path.exists():
+        raw = path.read_bytes()
+        if len(raw) != 32:
+            raise IntegrityError(
+                f"signing key {path} must contain exactly 32 raw bytes; found {len(raw)}"
+            )
+        return Ed25519PrivateKey.from_private_bytes(raw), False
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    private_key = Ed25519PrivateKey.generate()
+    raw = private_key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(raw)
+        handle.flush()
+        os.fsync(handle.fileno())
+    return private_key, True
+
+
+def _resolve_trust_anchor(value: str) -> str:
+    """Accept a 64-character SHA-256 fingerprint or a text file containing it."""
+    possible_path = Path(value)
+    if possible_path.is_file():
+        value = possible_path.read_text(encoding="utf-8").strip()
+    value = value.strip().lower()
+    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+        raise IntegrityError("trust anchor must be a 64-character hexadecimal SHA-256 value")
+    return value
+
+
+def _command_encode(args: argparse.Namespace) -> int:
+    input_path = Path(args.input)
+    output_dir = Path(args.output_dir)
+    signing_key_path = Path(args.signing_key)
+
+    plaintext = input_path.read_bytes()
+    signing_key, created = _load_or_create_signing_key(signing_key_path)
+    codec = HoloRAIDSecure(
+        n=args.n,
+        k=args.k,
+        prime_start=args.prime_start,
+        signing_key=signing_key,
+    )
+    bundle = codec.encode(plaintext)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    planned = [output_dir / MANIFEST_FILENAME]
+    planned.extend(output_dir / f"shard_{index:03d}.hrs2" for index in range(codec.n))
+    planned.extend(
+        [output_dir / TRUST_ANCHOR_FILENAME, output_dir / METADATA_FILENAME]
+    )
+    occupied = [str(path) for path in planned if path.exists()]
+    if occupied and not args.force:
+        raise FileExistsError(
+            "refusing to overwrite existing output; use --force: " + ", ".join(occupied)
+        )
+
+    _atomic_write(output_dir / MANIFEST_FILENAME, bundle.manifest.to_bytes())
+    for shard in bundle.shards:
+        _atomic_write(output_dir / f"shard_{shard.index:03d}.hrs2", shard.to_bytes())
+
+    trust_anchor = bundle.trust_anchor
+    _atomic_write(
+        output_dir / TRUST_ANCHOR_FILENAME,
+        (trust_anchor + "\n").encode("ascii"),
+    )
+    metadata = {
+        "format": "HoloRAID Secure v2",
+        "input_name": input_path.name,
+        "plaintext_bytes": len(plaintext),
+        "n": codec.n,
+        "k": codec.k,
+        "recoverable_erasures": codec.n - codec.k,
+        "chunk_size_bytes": codec.chunk_size,
+        "serialized_bytes": bundle.serialized_size,
+        "serialized_storage_factor": (
+            bundle.serialized_size / len(plaintext) if plaintext else None
+        ),
+        "trust_anchor_sha256": trust_anchor,
+        "security": {
+            "plaintext_confidentiality": "ChaCha20-Poly1305 with a fresh 256-bit key and nonce",
+            "threshold_key_release": f"Shamir {codec.k}-of-{codec.n}",
+            "shard_authentication": "Ed25519 signatures",
+            "rewrite_detection": "signature, manifest metadata, ciphertext SHA-256, and AEAD tag",
+        },
+    }
+    _atomic_write(
+        output_dir / METADATA_FILENAME,
+        (json.dumps(metadata, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+    )
+
+    print("HoloRAID Secure encode complete")
+    print(f"Input                      : {input_path}")
+    print(f"Plaintext bytes            : {len(plaintext):,}")
+    print(f"Configuration              : n={codec.n}, k={codec.k}")
+    print(f"Recoverable erasures       : {codec.n - codec.k}")
+    print(f"Output directory           : {output_dir}")
+    print(f"Signing key                : {signing_key_path} ({'created' if created else 'loaded'})")
+    print(f"Trust anchor SHA-256       : {trust_anchor}")
+    print("SECURITY ACTION            : copy the trust anchor to a separate trusted channel.")
+    print("Do not rely only on the copy stored beside the shards.")
+    return 0
+
+
+def _command_decode(args: argparse.Namespace) -> int:
+    input_dir = Path(args.input_dir)
+    output_path = Path(args.output)
+    trust_anchor = _resolve_trust_anchor(args.trust_anchor)
+
+    manifest = Manifest.from_bytes((input_dir / MANIFEST_FILENAME).read_bytes())
+    parsed_shards: list[Optional[Shard]] = []
+    parse_failures: list[tuple[str, str]] = []
+    for path in sorted(input_dir.glob(SHARD_GLOB)):
+        try:
+            parsed_shards.append(Shard.from_bytes(path.read_bytes()))
+        except (IntegrityError, OSError, ValueError) as exc:
+            parse_failures.append((path.name, str(exc)))
+
+    codec = HoloRAIDSecure(
+        n=manifest.n,
+        k=manifest.k,
+        max_subset_trials=args.max_subset_trials,
+    )
+    plaintext, report = codec.decode(
+        manifest,
+        parsed_shards,
+        expected_trust_anchor=trust_anchor,
+    )
+    _atomic_write(output_path, plaintext)
+
+    print("HoloRAID Secure decode complete")
+    print(f"Output                     : {output_path}")
+    print(f"Recovered plaintext bytes  : {len(plaintext):,}")
+    print(f"Authentic shard indices    : {report.valid_indices}")
+    print(f"Used shard indices         : {report.used_indices}")
+    print(f"Rejected/missing records   : {len(report.rejected) + len(parse_failures)}")
+    print(f"Candidate subsets tried    : {report.subset_trials}")
+    print(f"Recovery time              : {report.elapsed_seconds:.4f}s")
+    for name, reason in parse_failures:
+        print(f"  malformed {name}: {reason}")
+    for index, reason in report.rejected:
+        print(f"  rejected shard {index}: {reason}")
+    return 0
+
+
+def _mib_per_second(byte_count: int, seconds: float) -> float:
+    if seconds <= 0:
+        return float("inf")
+    return byte_count / (1024 * 1024) / seconds
+
+
+def _command_self_test(args: argparse.Namespace) -> int:
+    print("=" * 78)
+    print("HoloRAID Secure v2 — single-file verification suite")
+    print("=" * 78)
+
+    codec = HoloRAIDSecure(n=10, k=6)
+    data = os.urandom(args.bytes)
+
+    encode_start = perf_counter()
+    bundle = codec.encode(data)
+    encode_seconds = perf_counter() - encode_start
+
+    selected_indices = (0, 2, 4, 5, 7, 9)
+    recovered, report = codec.decode(
+        bundle.manifest,
+        [bundle.shards[index] for index in selected_indices],
+        expected_trust_anchor=bundle.trust_anchor,
+    )
+    assert recovered == data
+
+    # Exhaust every threshold subset on a smaller independent payload.
+    subset_data = os.urandom(2048)
+    subset_bundle = codec.encode(subset_data)
+    subset_total = math.comb(codec.n, codec.k)
+    subset_passed = 0
+    for indices in combinations(range(codec.n), codec.k):
+        value, _ = codec.decode(
+            subset_bundle.manifest,
+            [subset_bundle.shards[index] for index in indices],
+            expected_trust_anchor=subset_bundle.trust_anchor,
+        )
+        subset_passed += int(value == subset_data)
+    assert subset_passed == subset_total
+
+    # Three attacker-rewritten shard payloads plus one erased shard.
+    damaged: list[Optional[Shard]] = list(bundle.shards)
+    damaged[0] = flip_residue_bit(bundle.shards[0], 0, 1)
+    damaged[3] = flip_residue_bit(bundle.shards[3], 1, 2)
+    damaged[8] = flip_residue_bit(bundle.shards[8], 2, 3)
+    damaged[9] = None
+    repaired, tamper_report = codec.decode(
+        bundle.manifest,
+        damaged,
+        expected_trust_anchor=bundle.trust_anchor,
+    )
+    assert repaired == data
+    assert {0, 3, 8}.issubset({index for index, _ in tamper_report.rejected})
+
+    # Below-threshold access must fail closed.
+    below_threshold_blocked = False
+    try:
+        codec.decode(
+            bundle.manifest,
+            bundle.shards[: codec.k - 1],
+            expected_trust_anchor=bundle.trust_anchor,
+        )
+    except ThresholdError:
+        below_threshold_blocked = True
+    assert below_threshold_blocked
+
+    # Re-encoding identical plaintext must produce independent ciphertext.
+    second = codec.encode(data)
+    randomized = (
+        bundle.manifest.dataset_id != second.manifest.dataset_id
+        and bundle.manifest.nonce != second.manifest.nonce
+        and bundle.manifest.ciphertext_sha256 != second.manifest.ciphertext_sha256
+        and bundle.shards[0].residues != second.shards[0].residues
+    )
+    assert randomized
+
+    # The plaintext should never be embedded verbatim in serialized shard records.
+    plaintext_absent = all(data not in shard.to_bytes() for shard in bundle.shards)
+    assert plaintext_absent
+
+    # An attacker may create a complete replacement bundle, but the original
+    # out-of-band trust fingerprint rejects the attacker's signing identity.
+    attacker = HoloRAIDSecure(n=10, k=6)
+    forged_bundle = attacker.encode(b"attacker-controlled replacement")
+    signer_substitution_blocked = False
+    try:
+        codec.decode(
+            forged_bundle.manifest,
+            forged_bundle.shards[:6],
+            expected_trust_anchor=bundle.trust_anchor,
+        )
+    except IntegrityError:
+        signer_substitution_blocked = True
+    assert signer_substitution_blocked
+
+    # Binary disk round-trip with actual CLI serialization objects.
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        root = Path(temporary_directory)
+        _atomic_write(root / MANIFEST_FILENAME, bundle.manifest.to_bytes())
+        for shard in bundle.shards:
+            _atomic_write(root / f"shard_{shard.index:03d}.hrs2", shard.to_bytes())
+        disk_manifest = Manifest.from_bytes((root / MANIFEST_FILENAME).read_bytes())
+        disk_shards = [
+            Shard.from_bytes(path.read_bytes())
+            for path in sorted(root.glob(SHARD_GLOB))
+        ]
+        disk_plaintext, _ = codec.decode(
+            disk_manifest,
+            disk_shards[: codec.k],
+            expected_trust_anchor=bundle.trust_anchor,
+        )
+        assert disk_plaintext == data
+
+    # Random bounded attack campaign: no more than n-k unavailable shards.
+    random_source = random.Random(20260715)
+    survived = 0
+    injected_rewrites = 0
+    trials = args.trials
+    for _ in range(trials):
+        trial: list[Optional[Shard]] = list(bundle.shards)
+        unavailable = random_source.randint(0, codec.n - codec.k)
+        for index in random_source.sample(range(codec.n), unavailable):
+            if random_source.random() < 0.5:
+                trial[index] = None
+            else:
+                trial[index] = flip_residue_bit(
+                    bundle.shards[index],
+                    random_source.randrange(bundle.manifest.num_chunks),
+                    random_source.randrange(24),
+                )
+                injected_rewrites += 1
+        value, _ = codec.decode(
+            bundle.manifest,
+            trial,
+            expected_trust_anchor=bundle.trust_anchor,
+        )
+        survived += int(value == data)
+    assert survived == trials
+
+    print(f"Configuration                 : n={codec.n}, k={codec.k}")
+    print(f"Test payload                  : {len(data):,} bytes")
+    print(f"Recoverable erasures          : {codec.n - codec.k}/{codec.n}")
+    print(f"CRT chunk capacity            : {codec.chunk_size} bytes")
+    print(f"Payload-only storage factor   : {codec.ideal_residue_overhead:.3f}x")
+    print(f"Measured serialized factor    : {bundle.serialized_size / max(1, len(data)):.3f}x")
+    print(f"Encode throughput             : {_mib_per_second(len(data), encode_seconds):.2f} MiB/s")
+    print(f"Decode throughput             : {_mib_per_second(len(data), report.elapsed_seconds):.2f} MiB/s")
+    print(f"Exact authenticated recovery  : {recovered == data}")
+    print(f"All k-subsets                 : {subset_passed}/{subset_total} exact")
+    print(f"3 rewritten + 1 erased        : recovered={repaired == data}")
+    print(f"Rewritten shard signatures    : rejected={len(tamper_report.rejected) - 1}")
+    print(f"Below-threshold access        : blocked={below_threshold_blocked}")
+    print(f"Same plaintext randomized     : {randomized}")
+    print(f"Plaintext absent from shards  : {plaintext_absent}")
+    print(f"Signer substitution attack    : blocked={signer_substitution_blocked}")
+    print(f"Random attack campaign        : {survived}/{trials} exact recoveries")
+    print(f"Injected shard rewrites       : {injected_rewrites} (signature-rejected)")
+    print("=" * 78)
+    print("RESULT: confidentiality, shard authentication, and threshold recovery passed.")
+    print("NOTE: this is a research reference implementation and has not been audited.")
+    return 0
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="holoraid_secure_github.py",
+        description=(
+            "Single-file authenticated and confidential CRT threshold erasure coding. "
+            "Requires the 'cryptography' package."
+        ),
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    encode_parser = subparsers.add_parser("encode", help="encrypt and split a file")
+    encode_parser.add_argument("input", help="plaintext input file")
+    encode_parser.add_argument("output_dir", help="directory for manifest and shards")
+    encode_parser.add_argument(
+        "--signing-key",
+        required=True,
+        help="raw Ed25519 private-key file; created with mode 0600 when absent",
+    )
+    encode_parser.add_argument("--n", type=int, default=10, help="total shards (default: 10)")
+    encode_parser.add_argument("--k", type=int, default=6, help="required shards (default: 6)")
+    encode_parser.add_argument(
+        "--prime-start",
+        type=int,
+        default=2**61 - 1,
+        help="first 64-bit prime search candidate",
+    )
+    encode_parser.add_argument("--force", action="store_true", help="overwrite output files")
+    encode_parser.set_defaults(handler=_command_encode)
+
+    decode_parser = subparsers.add_parser("decode", help="authenticate and recover a file")
+    decode_parser.add_argument("input_dir", help="directory containing manifest and shards")
+    decode_parser.add_argument("output", help="recovered plaintext output file")
+    decode_parser.add_argument(
+        "--trust-anchor",
+        required=True,
+        help="trusted SHA-256 fingerprint or path to a file containing it",
+    )
+    decode_parser.add_argument(
+        "--max-subset-trials",
+        type=int,
+        default=10_000,
+        help="maximum authenticated k-subsets to try",
+    )
+    decode_parser.set_defaults(handler=_command_decode)
+
+    test_parser = subparsers.add_parser("self-test", help="run recovery and attack tests")
+    test_parser.add_argument(
+        "--bytes",
+        type=int,
+        default=1024 * 1024,
+        help="benchmark payload size (default: 1 MiB)",
+    )
+    test_parser.add_argument(
+        "--trials",
+        type=int,
+        default=100,
+        help="random bounded attack trials (default: 100)",
+    )
+    test_parser.set_defaults(handler=_command_self_test)
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return int(args.handler(args))
+    except (HoloRAIDError, OSError, ValueError) as exc:
+        parser.exit(2, f"error: {exc}\n")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
